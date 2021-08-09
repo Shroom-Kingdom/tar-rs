@@ -1,10 +1,10 @@
-use std::cell::{Cell, RefCell};
 use std::cmp;
 use std::fs;
 use std::io;
 use std::io::prelude::*;
 use std::marker;
 use std::path::Path;
+use std::sync::RwLock;
 
 use crate::entry::{EntryFields, EntryIo};
 use crate::error::TarError;
@@ -20,13 +20,13 @@ pub struct Archive<R: ?Sized + Read> {
 }
 
 pub struct ArchiveInner<R: ?Sized> {
-    pos: Cell<u64>,
+    pos: RwLock<u64>,
     unpack_xattrs: bool,
     preserve_permissions: bool,
     preserve_mtime: bool,
     overwrite: bool,
     ignore_zeros: bool,
-    obj: RefCell<R>,
+    obj: RwLock<R>,
 }
 
 /// An iterator over the entries of an archive.
@@ -52,15 +52,15 @@ impl<R: Read> Archive<R> {
                 preserve_mtime: true,
                 overwrite: true,
                 ignore_zeros: false,
-                obj: RefCell::new(obj),
-                pos: Cell::new(0),
+                obj: RwLock::new(obj),
+                pos: RwLock::new(0),
             },
         }
     }
 
     /// Unwrap this archive, returning the underlying object.
     pub fn into_inner(self) -> R {
-        self.inner.obj.into_inner()
+        self.inner.obj.into_inner().unwrap()
     }
 
     /// Construct an iterator over the entries in this archive.
@@ -72,7 +72,7 @@ impl<R: Read> Archive<R> {
     pub fn entries(&mut self) -> io::Result<Entries<R>> {
         let me: &mut Archive<dyn Read> = self;
         me._entries().map(|fields| Entries {
-            fields: fields,
+            fields,
             _ignored: marker::PhantomData,
         })
     }
@@ -145,7 +145,7 @@ impl<R: Read> Archive<R> {
 
 impl<'a> Archive<dyn Read + 'a> {
     fn _entries(&mut self) -> io::Result<EntriesFields> {
-        if self.inner.pos.get() != 0 {
+        if *self.inner.pos.read().unwrap() != 0 {
             return Err(other(
                 "cannot call entries unless archive is at \
                  position 0",
@@ -213,10 +213,7 @@ impl<'a, R: Read> Entries<'a, R> {
     /// or long link archive members. Raw iteration is disabled by default.
     pub fn raw(self, raw: bool) -> Entries<'a, R> {
         Entries {
-            fields: EntriesFields {
-                raw: raw,
-                ..self.fields
-            },
+            fields: EntriesFields { raw, ..self.fields },
             _ignored: marker::PhantomData,
         }
     }
@@ -240,7 +237,7 @@ impl<'a> EntriesFields<'a> {
         let mut header_pos = self.next;
         loop {
             // Seek to the start of the next header in the archive
-            let delta = self.next - self.archive.inner.pos.get();
+            let delta = self.next - *self.archive.inner.pos.read().unwrap();
             self.archive.skip(delta)?;
 
             // EOF is an indicator that we are at the end of the archive.
@@ -282,11 +279,11 @@ impl<'a> EntriesFields<'a> {
             }
         }
         let ret = EntryFields {
-            size: size,
-            header_pos: header_pos,
-            file_pos: file_pos,
+            size,
+            header_pos,
+            file_pos,
             data: vec![EntryIo::Data((&self.archive.inner).take(size))],
-            header: header,
+            header,
             long_pathname: None,
             long_linkname: None,
             pax_extensions: None,
@@ -502,10 +499,10 @@ impl<'a> Iterator for EntriesFields<'a> {
 
 impl<'a, R: ?Sized + Read> Read for &'a ArchiveInner<R> {
     fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        self.obj.borrow_mut().read(into).map(|i| {
-            self.pos.set(self.pos.get() + i as u64);
-            i
-        })
+        let i = self.obj.write().unwrap().read(into)?;
+        let pos = *self.pos.read().unwrap();
+        *self.pos.write().unwrap() = pos + i as u64;
+        Ok(i)
     }
 }
 
